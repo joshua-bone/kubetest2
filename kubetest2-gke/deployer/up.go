@@ -17,42 +17,21 @@ limitations under the License.
 package deployer
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/pkg/math"
 	"golang.org/x/sync/errgroup"
 	"k8s.io/klog"
 
 	"sigs.k8s.io/kubetest2/pkg/exec"
 	"sigs.k8s.io/kubetest2/pkg/metadata"
 )
-
-type UpConfig struct {
-	ClusterConfigs []ClusterConfig
-}
-
-type ClusterConfig struct {
-	Name                    string
-	Project                 string
-	Autopilot               bool
-	Network                 string
-	MachineType             string
-	NumNodes                int
-	ImageType               string
-	ReleaseChannel          string
-	Version                 string
-	WorkloadIdentityEnabled bool
-	Regions                 []string
-	Zones                   []string
-	PrivateClusterArgs      []string
-}
 
 // Deployer implementation methods below
 func (d *deployer) Up() error {
@@ -66,7 +45,7 @@ func (d *deployer) Up() error {
 			return
 		}
 		if err := d.DumpClusterLogs(); err != nil {
-			klog.Warningf("Dumping cluster logs at the end of Up() failed: %w", err)
+			klog.Warningf("Dumping cluster logs at the end of Up() failed: %s", err)
 		}
 	}()
 
@@ -77,124 +56,80 @@ func (d *deployer) Up() error {
 	if err := d.createNetwork(); err != nil {
 		return err
 	}
+	if err := d.createSubnets(); err != nil {
+		return err
+	}
+	if err := d.setupNetwork(); err != nil {
+		return err
+	}
 
-	log.Printf("creating clusters##########")
+	klog.V(2).Infof("Environment: %v", os.Environ())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eg, ctx := errgroup.WithContext(ctx)
+	loc := locationFlag(d.region, d.zone)
+	for i := range d.projects {
+		project := d.projects[i]
+		subNetworkArgs := subNetworkArgs(d.autopilot, d.projects, regionFromLocation(d.region, d.zone), d.network, i)
+		for j := range d.projectClustersLayout[project] {
+			cluster := d.projectClustersLayout[project][j]
+			privateClusterArgs := privateClusterArgs(d.projects, d.network, d.privateClusterAccessLevel, d.privateClusterMasterIPRanges, cluster)
+			eg.Go(func() error {
+				// Create the cluster
+				args := d.createCommand()
+				args = append(args,
+					"--project="+project,
+					loc,
+					"--network="+transformNetworkName(d.projects, d.network),
+				)
+				// A few args are not supported in GKE Autopilot cluster creation, so they should be left unset.
+				// https://cloud.google.com/sdk/gcloud/reference/container/clusters/create-auto
+				if !d.autopilot {
+					args = append(args, "--machine-type="+d.machineType)
+					args = append(args, "--num-nodes="+strconv.Itoa(d.nodes))
+					args = append(args, "--image-type="+d.imageType)
+				}
 
-	if err := d.createClusters(); err != nil {
-		return fmt.Errorf("error creating the clusters: %w", err)
+				if d.workloadIdentityEnabled {
+					args = append(args, fmt.Sprintf("--workload-pool=%s.svc.id.goog", project))
+				}
+				if d.ReleaseChannel != "" {
+					args = append(args, "--release-channel="+d.ReleaseChannel)
+					if d.Version == "latest" {
+						// If latest is specified, get the latest version from server config for this channel.
+						actualVersion, err := resolveLatestVersionInChannel(loc, d.ReleaseChannel)
+						if err != nil {
+							return err
+						}
+						klog.V(0).Infof("Using the latest version %q in %q channel", actualVersion, d.ReleaseChannel)
+						args = append(args, "--cluster-version="+actualVersion)
+					} else {
+						args = append(args, "--cluster-version="+d.Version)
+					}
+				} else {
+					args = append(args, "--cluster-version="+d.Version)
+				}
+				args = append(args, subNetworkArgs...)
+				args = append(args, privateClusterArgs...)
+				args = append(args, cluster.name)
+				if err := runWithOutput(exec.CommandContext(ctx, "gcloud", args...)); err != nil {
+					// Cancel the context to kill other cluster creation processes if any error happens.
+					cancel()
+					return fmt.Errorf("error creating cluster: %v", err)
+				}
+				return nil
+			})
+		}
+	}
+
+	if err := eg.Wait(); err != nil {
+		return fmt.Errorf("error creating clusters: %v", err)
 	}
 
 	if err := d.testSetup(); err != nil {
-		return fmt.Errorf("error running setup for the tests: %w", err)
+		return fmt.Errorf("error running setup for the tests: %v", err)
 	}
 
-	return nil
-}
-
-func (d *deployer) createClusters() error {
-	klog.V(2).Infof("Environment: %v", os.Environ())
-
-	totalTryCount := math.Max(len(d.regions), len(d.zones))
-	for retryCount := 0; retryCount < totalTryCount; retryCount++ {
-		d.retryCount = retryCount
-
-		if err := d.createSubnets(); err != nil {
-			return err
-		}
-		if err := d.setupNetwork(); err != nil {
-			return err
-		}
-
-		eg := new(errgroup.Group)
-		locationArg := locationFlag(d.regions, d.zones, retryCount)
-		for i := range d.projects {
-			project := d.projects[i]
-			clusters := d.projectClustersLayout[project]
-			subNetworkArgs := subNetworkArgs(d.autopilot, d.projects, regionFromLocation(d.regions, d.zones, d.retryCount), d.network, i)
-			for j := range clusters {
-				cluster := clusters[j]
-				eg.Go(
-					func() error {
-						return d.createCluster(project, cluster, subNetworkArgs, locationArg)
-					},
-				)
-			}
-		}
-
-		eg.Wait()
-		r := retryCount
-		if err := eg.Wait(); err != nil {
-			if d.isRetryableError(err) {
-				go func() {
-					d.deleteClusters(r)
-					d.deleteSubnets(r)
-				}()
-			} else {
-				return fmt.Errorf("error creating clusters: %v", err)
-			}
-
-		} else {
-			return nil
-		}
-	}
-
-	return nil
-}
-
-// isRetryableError checks if the error happens during cluster creation can be potentially solved by retrying or not.
-func (d *deployer) isRetryableError(err error) bool {
-	for _, regx := range d.retryableErrorPatternsCompiled {
-		if regx.MatchString(err.Error()) {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *deployer) createCluster(project string, cluster cluster, subNetworkArgs []string, locationArg string) error {
-	privateClusterArgs := privateClusterArgs(d.projects, d.network, d.privateClusterAccessLevel, d.privateClusterMasterIPRanges, cluster)
-	// Create the cluster
-	args := d.createCommand()
-	args = append(args,
-		"--project="+project,
-		locationArg,
-		"--network="+transformNetworkName(d.projects, d.network),
-	)
-	// A few args are not supported in GKE Autopilot cluster creation, so they should be left unset.
-	// https://cloud.google.com/sdk/gcloud/reference/container/clusters/create-auto
-	if !d.autopilot {
-		args = append(args, "--machine-type="+d.machineType)
-		args = append(args, "--num-nodes="+strconv.Itoa(d.nodes))
-		args = append(args, "--image-type="+d.imageType)
-	}
-
-	if d.workloadIdentityEnabled {
-		args = append(args, fmt.Sprintf("--workload-pool=%s.svc.id.goog", project))
-	}
-	if d.ReleaseChannel != "" {
-		args = append(args, "--release-channel="+d.ReleaseChannel)
-		if d.Version == "latest" {
-			// If latest is specified, get the latest version from server config for this channel.
-			actualVersion, err := resolveLatestVersionInChannel(locationArg, d.ReleaseChannel)
-			if err != nil {
-				return err
-			}
-			klog.V(0).Infof("Using the latest version %q in %q channel", actualVersion, d.ReleaseChannel)
-			args = append(args, "--cluster-version="+actualVersion)
-		} else {
-			args = append(args, "--cluster-version="+d.Version)
-		}
-	} else {
-		args = append(args, "--cluster-version="+d.Version)
-	}
-	args = append(args, subNetworkArgs...)
-	args = append(args, privateClusterArgs...)
-	args = append(args, cluster.name)
-	output, err := runWithOutputAndBuffer(exec.Command("gcloud", args...))
-	if err != nil {
-		//parse output for match with regex error
-		return fmt.Errorf("error creating cluster: %v, output: %q", err, output)
-	}
 	return nil
 }
 
@@ -226,7 +161,7 @@ func (d *deployer) IsUp() (up bool, err error) {
 
 	for _, project := range d.projects {
 		for _, cluster := range d.projectClustersLayout[project] {
-			if err := getClusterCredentials(project, locationFlag(d.regions, d.zones, d.retryCount), cluster.name); err != nil {
+			if err := getClusterCredentials(project, locationFlag(d.region, d.zone), cluster.name); err != nil {
 				return false, err
 			}
 
@@ -289,7 +224,7 @@ func (d *deployer) Kubeconfig() (string, error) {
 			if err := os.Setenv("KUBECONFIG", filename); err != nil {
 				return "", err
 			}
-			if err := getClusterCredentials(project, locationFlag(d.regions, d.zones, d.retryCount), cluster.name); err != nil {
+			if err := getClusterCredentials(project, locationFlag(d.region, d.zone), cluster.name); err != nil {
 				return "", err
 			}
 			kubecfgFiles = append(kubecfgFiles, filename)

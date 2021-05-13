@@ -79,7 +79,7 @@ export KUBE_NODE_OS_DISTRIBUTION='%[3]s'
 
 		cmd := exec.Command("bash", "-c", fmt.Sprintf(gkeLogDumpTemplate,
 			project,
-			d.zones,
+			d.zone,
 			os.Getenv("NODE_OS_DISTRIBUTION"),
 			strings.Join(filters, " OR "),
 			dumpCmd))

@@ -35,7 +35,27 @@ func (d *deployer) Down() error {
 			return err
 		}
 
-		d.deleteClusters(d.retryCount)
+		var wg sync.WaitGroup
+		for i := range d.projects {
+			project := d.projects[i]
+			for j := range d.projectClustersLayout[project] {
+				cluster := d.projectClustersLayout[project][j]
+				loc := locationFlag(d.region, d.zone)
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					// We best-effort try all of these and report errors as appropriate.
+					if err := runWithOutput(exec.Command(
+						"gcloud", containerArgs("clusters", "delete", "-q", cluster.name,
+							"--project="+project,
+							loc)...)); err != nil {
+						klog.Errorf("Error deleting cluster: %v", err)
+					}
+				}()
+			}
+		}
+		wg.Wait()
 
 		numDeletedFWRules, errCleanFirewalls := d.cleanupNetworkFirewalls(d.projects[0], d.network)
 		if errCleanFirewalls != nil {
@@ -47,7 +67,7 @@ func (d *deployer) Down() error {
 		if err := d.teardownNetwork(); err != nil {
 			return err
 		}
-		if err := d.deleteSubnets(d.retryCount); err != nil {
+		if err := d.deleteSubnets(); err != nil {
 			return err
 		}
 		if err := d.deleteNetwork(); err != nil {
@@ -56,34 +76,6 @@ func (d *deployer) Down() error {
 	}
 
 	return nil
-}
-
-func (d *deployer) deleteClusters(retryCount int) {
-	var wg sync.WaitGroup
-	for i := range d.projects {
-		project := d.projects[i]
-		for j := range d.projectClustersLayout[project] {
-			cluster := d.projectClustersLayout[project][j]
-			loc := locationFlag(d.regions, d.zones, retryCount)
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				d.deleteCluster(project, loc, cluster)
-			}()
-		}
-	}
-	wg.Wait()
-}
-
-func (d *deployer) deleteCluster(project, loc string, cluster cluster) {
-	// We best-effort try all of these and report errors as appropriate.
-	if err := runWithOutput(exec.Command(
-		"gcloud", containerArgs("clusters", "delete", "-q", cluster.name,
-			"--project="+project,
-			loc)...)); err != nil {
-		klog.Errorf("Error deleting cluster: %v", err)
-	}
 }
 
 // verifyDownFlags validates flags for down phase.
